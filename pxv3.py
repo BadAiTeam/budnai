@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-PROXY HUNTER v2 — Research-Grade Open Proxy Detection Framework
+PROXY HUNTER v3 — Research-Grade Open Proxy Detection Framework
 ================================================================
 
-Perubahan utama dari v1:
+Perubahan utama dari v1 → v2 → v3:
+
+  v1 → v2:
   1. DETECTION-VECTOR TRACKING
      - Setiap proxy yang ditemukan mencatat "vektor deteksi" apa yang
        mengungkapnya: banner, handshake-success, response-pattern, dll.
@@ -23,6 +25,27 @@ Perubahan utama dari v1:
      - Filter BOGON TETAP DIPERTAHANKAN — ini bukan pembatasan performa,
        melainkan pengaman agar tidak memindai infrastruktur internal/
        kritis (10.0.0.0/8, 127.0.0.0/8, dll). Men-on-kan ini = bug.
+
+  v2 → v3 (upgrade ini):
+  4. PROTOCOL IDENTIFICATION + CONNECTION PROTOCOL PERSISTENCE
+     - Setiap DetectionResult kini menyimpan field baru `connection_protocol`
+       yang menjelaskan transport layer yang DIPAKAI untuk mencapai proxy:
+         * "tcp-plain"     — TCP biasa ke proxy (HTTP proxy & SOCKS)
+         * "tcp-tunneled"  — TCP ke proxy + HTTP CONNECT tunnel ke target HTTPS
+         * "tcp-tls"       — TCP + TLS layer #1 ke proxy itu sendiri (true HTTPS proxy)
+       - Membedakan dari field `protocol` (http/https/https-tls/socks4/socks5)
+         yang menjelaskan protocol APLIKASI proxy.
+     - Output working_proxies.txt di-upgrade:
+         * Baris lama (v2): `1.2.3.4:8080`
+         * Baris baru (v3): `http://1.2.3.4:8080  # conn=tcp-tunneled anon=elite lat=123.4ms src=aggregated`
+       - Format utama `protocol://host:port` kompatibel dengan curl/requests/aiohttp.
+       - Metadata setelah `#` tidak mengganggu parser standar (bisa di-strip).
+     - detection_vectors.json kini menambahkan bucket `by_connection_protocol`
+       untuk analisis distribusi transport layer.
+
+  Semua fungsi lain (source aggregation, multi-processing, random scan,
+  debounced save, bogon filter, SOCKS handshake, anonymity classification,
+  CLI args) TIDAK diubah — konsistensi tetap terjaga.
 
 PERINGATAN HUKUM & ETIKA (tidak berubah dari v1):
   - Hanya gunakan untuk riset yang sah & authorized.
@@ -189,7 +212,7 @@ def random_public_ipv4() -> str:
 class DetectionResult:
     """Hasil deteksi satu proxy, termasuk vektor deteksi untuk riset."""
     proxy: str
-    protocol: str                      # http | https | socks4 | socks5
+    protocol: str                      # http | https | https-tls | socks4 | socks5
     ip: str
     port: int
     seen_ip: str                       # IP yang dilihat server target
@@ -205,6 +228,12 @@ class DetectionResult:
     #   "banner-matched"      — banner sesuai pola proxy (Squid, etc.)
     #   "origin-leaked"       — field "origin" ter-parse dari response
     source: str = "unknown"            # dari sumber mana proxy ini (untuk random scan: "random")
+    # ====== v3: connection_protocol (transport layer yang DIPAKAI ke proxy) ======
+    # Membedakan dari `protocol` (protocol APLIKASI proxy).
+    #   "tcp-plain"     — TCP biasa ke proxy (HTTP proxy & SOCKS4/5)
+    #   "tcp-tunneled"  — TCP ke proxy + HTTP CONNECT tunnel ke target HTTPS
+    #   "tcp-tls"       — TCP + TLS layer #1 ke proxy itu sendiri (true HTTPS proxy)
+    connection_protocol: str = "tcp-plain"
 
 
 # ======================== SOCKS HANDSHAKE ========================
@@ -369,6 +398,8 @@ def _test_true_https_proxy_sync(host: str, port: int, source: str,
             latency_ms=round(latency, 1),
             detection_vectors=vectors,
             source=source,
+            # v3: true HTTPS proxy — TCP + TLS layer #1 ke proxy itu sendiri
+            connection_protocol="tcp-tls",
         )
     except (socket.timeout, OSError, ssl.SSLError):
         return None
@@ -461,6 +492,10 @@ async def detect_proxy_type(host: str, port: int, session: aiohttp.ClientSession
                             seen_ip = data.get("origin", "unknown")
                             vectors.append("origin-leaked")
                             latency = (time.monotonic() - t0) * 1000
+                            # v3: klasifikasi transport layer
+                            #   - target HTTP  : TCP biasa ke proxy
+                            #   - target HTTPS : TCP ke proxy + CONNECT tunnel
+                            conn_proto = "tcp-tunneled" if target_scheme == "https" else "tcp-plain"
                             return DetectionResult(
                                 proxy=f"{host}:{port}",
                                 protocol=target_scheme,
@@ -473,6 +508,7 @@ async def detect_proxy_type(host: str, port: int, session: aiohttp.ClientSession
                                 latency_ms=round(latency, 1),
                                 detection_vectors=vectors,
                                 source=source,
+                                connection_protocol=conn_proto,
                             )
                         except Exception:
                             pass
@@ -524,6 +560,8 @@ async def detect_proxy_type(host: str, port: int, session: aiohttp.ClientSession
                         latency_ms=round(latency, 1),
                         detection_vectors=vectors,
                         source=source,
+                        # v3: SOCKS5 — TCP biasa ke proxy
+                        connection_protocol="tcp-plain",
                     )
             finally:
                 writer.close()
@@ -571,6 +609,8 @@ async def detect_proxy_type(host: str, port: int, session: aiohttp.ClientSession
                         latency_ms=round(latency, 1),
                         detection_vectors=vectors,
                         source=source,
+                        # v3: SOCKS4 — TCP biasa ke proxy
+                        connection_protocol="tcp-plain",
                     )
             finally:
                 writer.close()
@@ -687,10 +727,42 @@ class ResultStore:
             await asyncio.to_thread(self._save_summary_sync, results)
 
     def _save_summary_sync(self, results: list[DetectionResult]):
-        # TXT
+        # ====== v3: TXT dengan format protocol://ip:port + metadata ======
+        # Format lama (v2): "1.2.3.4:8080"
+        # Format baru (v3): "http://1.2.3.4:8080  # conn=tcp-tunneled anon=elite lat=123.4ms src=aggregated"
+        #
+        # Tujuan:
+        #   1. Baris utama `protocol://host:port` langsung dipakai oleh
+        #      curl --proxy, requests.proxies, aiohttp proxy=, dll.
+        #   2. Metadata setelah '#' bisa diabaikan parser (di-split '#' bila perlu)
+        #      namun memberi konteks lengkap untuk riset/manual review.
+        #   3. Backward compatible: parser lama yang hanya baca ip:port
+        #      cukup strip prefix "protocol://" dan suffix "# ..." .
         with open(self.txt_path, "w") as f:
             for r in results:
-                f.write(f"{r['proxy']}\n") if isinstance(r, dict) else f.write(f"{r.proxy}\n")
+                # r bisa berupa DetectionResult (single-process) atau dict (multi-process aggregator)
+                if isinstance(r, dict):
+                    proto = r.get("protocol", "http")
+                    proxy_str = r.get("proxy", "")
+                    conn = r.get("connection_protocol", "tcp-plain")
+                    anon = r.get("anonymity", "unknown")
+                    lat = r.get("latency_ms", 0)
+                    src = r.get("source", "unknown")
+                else:
+                    proto = r.protocol
+                    proxy_str = r.proxy
+                    conn = r.connection_protocol
+                    anon = r.anonymity
+                    lat = r.latency_ms
+                    src = r.source
+                # Sanitasi proto: hindari "https-tls://" (bukan skema standar);
+                # gunakan "https://" sebagai prefix URL karena connection-nya TLS.
+                # Nilai proto asli (https-tls) tetap tersimpan di JSONL/JSON.
+                url_scheme = "https" if proto in ("https", "https-tls") else proto
+                line = (f"{url_scheme}://{proxy_str}  "
+                        f"# conn={conn} anon={anon} "
+                        f"lat={lat}ms src={src} proto={proto}\n")
+                f.write(line)
         # JSON detail
         data = [asdict(r) if not isinstance(r, dict) else r for r in results]
         with open(self.json_path, "w") as f:
@@ -700,6 +772,7 @@ class ResultStore:
         protocol_counts: dict[str, int] = {}
         anonymity_counts: dict[str, int] = {}
         source_counts: dict[str, int] = {}
+        connection_protocol_counts: dict[str, int] = {}  # v3
         latencies: list[float] = []
         for r in data:
             for v in r["detection_vectors"]:
@@ -707,11 +780,17 @@ class ResultStore:
             protocol_counts[r["protocol"]] = protocol_counts.get(r["protocol"], 0) + 1
             anonymity_counts[r["anonymity"]] = anonymity_counts.get(r["anonymity"], 0) + 1
             source_counts[r["source"]] = source_counts.get(r["source"], 0) + 1
+            # v3: agregasi by connection_protocol
+            cp = r.get("connection_protocol", "tcp-plain")
+            connection_protocol_counts[cp] = connection_protocol_counts.get(cp, 0) + 1
             latencies.append(r["latency_ms"])
         analysis = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "total_proxies": len(data),
             "by_protocol": protocol_counts,
+            "by_connection_protocol": dict(sorted(  # v3
+                connection_protocol_counts.items(), key=lambda x: -x[1]
+            )),
             "by_anonymity": anonymity_counts,
             "by_source": source_counts,
             "by_detection_vector": dict(sorted(vector_counts.items(), key=lambda x: -x[1])),
@@ -751,7 +830,7 @@ async def test_proxy_list(proxies: list[str], session: aiohttp.ClientSession,
             results.append(res)
             stats["found"] += 1
             await store.append_one(res)
-            print(f"[+] {res.proxy} [{res.protocol}/{res.anonymity}] "
+            print(f"[+] {res.proxy} [{res.protocol}/{res.anonymity}/{res.connection_protocol}] "
                   f"lat={res.latency_ms}ms vec={res.detection_vectors} "
                   f"[{stats['done']}/{total}]")
         stats["done"] += 1
@@ -785,7 +864,7 @@ async def scan_random_ips(count: int, session: aiohttp.ClientSession,
             results.append(res)
             stats["found"] += 1
             await store.append_one(res)
-            print(f"[+] RANDOM {res.proxy} [{res.protocol}/{res.anonymity}] "
+            print(f"[+] RANDOM {res.proxy} [{res.protocol}/{res.anonymity}/{res.connection_protocol}] "
                   f"lat={res.latency_ms}ms vec={res.detection_vectors}")
         stats["done"] += 1
 
@@ -1120,7 +1199,8 @@ def run_multiprocess(args, proxies: list[str]) -> list[dict]:
 # ======================== CLI ========================
 def parse_args():
     p = argparse.ArgumentParser(
-        description="PROXY HUNTER v2 — Research-Grade Open Proxy Detection",
+        description="PROXY HUNTER v3 — Research-Grade Open Proxy Detection "
+                    "(+ protocol identification & connection_protocol persistence)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1165,7 +1245,8 @@ async def async_main(args):
     n_workers = args.workers if args.workers > 0 else multiprocessing.cpu_count()
 
     print("=" * 72)
-    print("   PROXY HUNTER v2 — Research-Grade Open Proxy Detection")
+    print("   PROXY HUNTER v3 — Research-Grade Open Proxy Detection")
+    print("   v3: + protocol identification & connection_protocol persistence")
     print("   ⚠  Hanya untuk riset/edukasi yang sah & authorized")
     print("=" * 72)
     print(f"   Waktu mulai : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1240,16 +1321,27 @@ async def async_main(args):
     print("\n" + "=" * 72)
     print(f"   Total proxy berfungsi: {len(results)}")
     by_proto: dict[str, int] = {}
+    by_conn: dict[str, int] = {}  # v3
     for r in results:
-        proto = r["protocol"] if isinstance(r, dict) else r.protocol
+        if isinstance(r, dict):
+            proto = r["protocol"]
+            conn = r.get("connection_protocol", "tcp-plain")
+        else:
+            proto = r.protocol
+            conn = r.connection_protocol
         by_proto[proto] = by_proto.get(proto, 0) + 1
+        by_conn[conn] = by_conn.get(conn, 0) + 1
+    print("   By protocol (aplikasi):")
     for k, v in by_proto.items():
-        print(f"     - {k:8s}: {v}")
+        print(f"     - {k:10s}: {v}")
+    print("   By connection_protocol (transport — v3):")
+    for k, v in sorted(by_conn.items(), key=lambda x: -x[1]):
+        print(f"     - {k:14s}: {v}")
     print(f"   Output dir  : {DEFAULT_CONFIG['OUTPUT_DIR']}/")
-    print(f"     - {DEFAULT_CONFIG['OUTPUT_TXT']}")
+    print(f"     - {DEFAULT_CONFIG['OUTPUT_TXT']}  (v3: protocol://ip:port + metadata)")
     print(f"     - {DEFAULT_CONFIG['OUTPUT_JSONL']}  (streaming, crash-safe)")
     print(f"     - {DEFAULT_CONFIG['OUTPUT_JSON']}")
-    print(f"     - {DEFAULT_CONFIG['OUTPUT_VECTORS']}  (analisis vektor deteksi)")
+    print(f"     - {DEFAULT_CONFIG['OUTPUT_VECTORS']}  (analisis vektor deteksi + by_connection_protocol)")
     if n_workers > 1:
         print(f"     - worker_*.jsonl  ({n_workers} file per-worker)")
     print("=" * 72)
